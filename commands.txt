@@ -1,0 +1,7 @@
+1) fpc vasm.pas => compile assembler
+2) ./vasm hello.asm hello.vmx
+3) compile code
+4) cl /EHsc vm.cpp => generate vm.exe (from visual studio dev cmd)
+*5) .\vm.exe hello.vmx
+6.1) fpc vdump.pas => disassembler check
+*6.2) ./vdump hello.vmx -r => disassembler check
