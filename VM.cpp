@@ -77,7 +77,7 @@ public:
     static bool LoadModule(const string& filename, PCB& pcb) {
         ifstream file(filename, ios::binary);
         if (!file.is_open()) {
-            cerr << "Грешка: Файлът не може да бъде отворен: " << filename << "\n";
+            cerr << "Грешка: Файлът " << filename << " не може да бъде отворен!" << "\n";
             return false;
         }
 
