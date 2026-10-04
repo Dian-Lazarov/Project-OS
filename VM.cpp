@@ -195,6 +195,8 @@ public:
 // ==========================================================
 // Цикъл извличане-декодиране-изпълнение на инструкция
 // ==========================================================
+bool trace_on = false; // Глобален флаг за режима на трасиране
+
 class CPU {
 public:
     // Функция за проверка дали инструкцията изисква операнд
@@ -206,6 +208,23 @@ public:
             (op == 0x60 || op == 0x62 || op == 0x63); // SEMINIT, WAIT, SIGNAL
     }
 
+    // Връща текстовото име на инструкцията
+    static string MnemOf(int32_t op) {
+        switch (op) {
+        case 0x00: return "HALT";   case 0x11: return "LDA";    case 0x12: return "STA";
+        case 0x13: return "LDS";    case 0x14: return "STS";    case 0x20: return "ADD";
+        case 0x21: return "SUB";    case 0x22: return "MUL";    case 0x23: return "DIV";
+        case 0x24: return "MOD";    case 0x25: return "NEG";    case 0x30: return "EQ";
+        case 0x31: return "NE";     case 0x32: return "LT";     case 0x33: return "LE";
+        case 0x34: return "GT";     case 0x35: return "GE";     case 0x36: return "AND";
+        case 0x37: return "OR";     case 0x38: return "NOT";    case 0x40: return "JMP";
+        case 0x41: return "JZ";     case 0x42: return "JNZ";    case 0x50: return "IN";
+        case 0x51: return "OUT";    case 0x52: return "OUTC";   case 0x60: return "SEMINIT";
+        case 0x62: return "WAIT";   case 0x63: return "SIGNAL";
+        default: return "???";
+        }
+    }
+
     // Изпълнение на една единствена инструкция
     static bool ExecOne(PCB& pcb) {
         // 1. Извличане (Fetch): Проверка дали PC е в рамките на процеса
@@ -214,6 +233,9 @@ public:
             pcb.state = PS_DONE;
             return false;
         }
+
+        // Запомняме адреса на инструкцията за трасирането
+        int32_t orig_pc = pcb.pc;
 
         int32_t op = Memory[pcb.pc++];
         pcb.instr_count++;
@@ -227,6 +249,15 @@ public:
                 return false;
             }
             opd = Memory[pcb.pc++];
+        }
+
+        // Режим на трасиране
+        if (trace_on) {
+            cout << "[" << pcb.pid << "] trace "
+                << right << setw(4) << (orig_pc - pcb.base) << ": "
+                << left << setw(7) << MnemOf(op) << " "
+                << right << setw(5) << opd
+                << "   ACC=" << pcb.acc << "\n";
         }
 
         // Помощна функция за проверка на валиден адрес за данни
@@ -337,6 +368,19 @@ public:
             break;
 
             // Вход / Изход
+        case 0x50: // IN
+            // Ако имаме текст в буфера (например подкана "Въведи N: "), го извеждаме
+            if (!pcb.out_buf.empty()) {
+                cout << "[" << pcb.pid << "] " << pcb.out_buf << "\n";
+                pcb.out_buf = "";
+            }
+            cout << "[" << pcb.pid << "] Въведете стойност: ";
+            cin >> pcb.acc;
+
+            if (trace_on) {
+                cout << "      -> Прочетена стойност: " << pcb.acc << "\n";
+            }
+            break;
         case 0x51: // OUT (Извежда десетично число)
             pcb.out_buf += to_string(pcb.acc);
             break;
@@ -388,11 +432,21 @@ int main(int argc, char* argv[]) {
     system("chcp 1251 > nul");
 
     if (argc < 2) {
-        cerr << "Употреба: " << argv[0] << " <module.vmx>\n";
+        cerr << "Употреба: " << argv[0] << " <module.vmx> [-t]\n";
+        cerr << "  -t : Включване на режим на трасиране\n";
         return 1;
     }
 
     string filename = argv[1];
+
+    // Проверка за наличие на флаг -t
+    if (argc >= 3) {
+        string flag = argv[2];
+        if (flag == "-t") {
+            trace_on = true;
+        }
+    }
+
     PCB process1;
     process1.pid = 1;
     process1.instr_count = 0; // Инициализация
