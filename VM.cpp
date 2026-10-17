@@ -1,3 +1,4 @@
+#define NOMINMAX
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -5,6 +6,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <sstream>
+#include <windows.h>
 
 using namespace std;
 
@@ -14,6 +16,9 @@ using namespace std;
 
 const int32_t MEM_SIZE = 2048; // Лимит на потребителската памет в думи
 const int32_t MAX_EXT = 32;    // Максимален брой външни имена
+const int32_t USER_RING = 400; // Кръгов буфер за потребителската конзола
+const int32_t SYS_RING = 20;   // Буфер за системната конзола
+const int32_t SYS_DEFAULT = 3; // Видими системни редове по подразбиране
 
 // Състояния на процеса
 enum ProcessState {
@@ -40,24 +45,20 @@ struct Xlat {
 
 // Блок за управление на процес (PCB)
 struct PCB {
-	int32_t pid;
+	int32_t pid = 1;
 	string module_name;
-	ProcessState state;
+	ProcessState state = PS_NEW;
 
 	// Съхранен контекст
-	int32_t pc;
-	int32_t acc;
-	int32_t base;
-	int32_t limit;
+	int32_t pc = 0, acc = 0, base = 0, limit = 0;
 
 	// Информация за изпълнимия модул
-	int32_t image_size;
-	int32_t entry;
+	int32_t image_size = 0, entry = 0;
 
 	// За планировчика
-	int32_t priority;
-	int32_t est_time;
-	int32_t instr_count;
+	int32_t priority = 1;
+	int32_t est_time = 1000000;
+	int32_t instr_count = 0;
 
 	vector<Xlat> xlat;
 	vector<int32_t> image; // Временно пази образеца преди заемане на памет
@@ -67,6 +68,258 @@ struct PCB {
 
 // Глобална памет (модел на реалната памет)
 vector<int32_t> Memory(MEM_SIZE, 0);
+
+// =================================================================
+// Управление на двете конзоли (системна + потребителска)
+// =================================================================
+
+class Console {
+public:
+	static HANDLE hOut;
+	static HANDLE hIn;
+	static WORD def_attr;
+	static int org_y;
+	static bool is_console;
+
+	static int scr_w;
+	static int scr_h;
+	static int sys_rows;
+	static int user_bottom;
+
+	static vector<string> u_ring;
+	static int u_head;
+	static vector<string> sys_lines;
+	static string line_buf;
+	static bool paused;
+
+	// Инициализация и проверка какво поддържа средата
+	static void Init() {
+		hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+		hIn = GetStdHandle(STD_INPUT_HANDLE);
+		def_attr = 7;
+		org_y = 0;
+
+		CONSOLE_SCREEN_BUFFER_INFO bi;
+		// Проверка дали средата поддържа конзолен екран
+		if (GetConsoleScreenBufferInfo(hOut, &bi)) {
+			is_console = true;
+			def_attr = bi.wAttributes;
+
+			// Изравняваме размера на буфера с прозореца, за да съвпадат координатите
+			COORD sz;
+			sz.X = bi.srWindow.Right - bi.srWindow.Left + 1;
+			sz.Y = bi.srWindow.Bottom - bi.srWindow.Top + 1;
+			SetConsoleScreenBufferSize(hOut, sz);
+
+			if (GetConsoleScreenBufferInfo(hOut, &bi)) {
+				org_y = bi.srWindow.Top;
+			}
+		}
+		else {
+			is_console = false;
+		}
+
+		QueryScreenSize();
+		user_bottom = scr_h - sys_rows - 2;
+		if (user_bottom < 3) user_bottom = 3;
+
+		u_head = 0;
+		for (int i = 0; i < SYS_RING; ++i) sys_lines[i] = "";
+
+		ScrClearAll();
+		RepaintUser();
+		DrawSeparator();
+		DrawSysArea();
+		DrawPrompt();
+	}
+
+	static void Done() {
+		if (is_console) {
+			ScrGoto(0, scr_h - 1);
+		}
+		cout << "\n";
+	}
+
+	static void QueryScreenSize() {
+		scr_w = 80;
+		scr_h = 25;
+		if (!is_console) return;
+
+		CONSOLE_SCREEN_BUFFER_INFO bi;
+		if (GetConsoleScreenBufferInfo(hOut, &bi)) {
+			scr_w = bi.srWindow.Right - bi.srWindow.Left + 1;
+			scr_h = bi.srWindow.Bottom - bi.srWindow.Top + 1;
+			org_y = bi.srWindow.Top;
+		}
+	}
+
+	static void ScrGoto(int x, int y) {
+		if (!is_console) return;
+		COORD c = { static_cast<SHORT>(x), static_cast<SHORT>(org_y + y) };
+		SetConsoleCursorPosition(hOut, c);
+	}
+
+	static void ScrClearLine(int y) {
+		if (!is_console) return;
+		COORD c = { 0, static_cast<SHORT>(org_y + y) };
+		DWORD n;
+		FillConsoleOutputCharacterA(hOut, ' ', scr_w, c, &n);
+		FillConsoleOutputAttribute(hOut, def_attr, scr_w, c, &n);
+	}
+
+	static void ScrClearAll() {
+		if (!is_console) return;
+		COORD c = { 0, static_cast<SHORT>(org_y) };
+		DWORD n;
+		FillConsoleOutputCharacterA(hOut, ' ', scr_w * scr_h, c, &n);
+		FillConsoleOutputAttribute(hOut, def_attr, scr_w * scr_h, c, &n);
+	}
+
+	static void ScrPut(int x, int y, const string& s) {
+		if (!is_console) return;
+		if (x < 0 || x >= scr_w || y < 0 || y >= scr_h) return;
+		ScrGoto(x, y);
+		int max_len = scr_w - x - 1;
+		if (max_len > 0) {
+			cout << s.substr(0, max_len);
+			cout.flush();
+		}
+	}
+
+	static void DrawPrompt() {
+		if (!is_console) return;
+		ScrClearLine(scr_h - 1);
+		ScrPut(0, scr_h - 1, "> " + line_buf);
+	}
+
+	static void DrawSysArea() {
+		if (!is_console) return;
+		for (int i = 0; i < sys_rows; ++i) {
+			ScrClearLine(user_bottom + 1 + i);
+			ScrPut(0, user_bottom + 1 + i, sys_lines[SYS_RING - sys_rows + i]);
+		}
+	}
+
+	static void DrawSeparator() {
+		if (!is_console) return;
+		string bar;
+		if (paused && scr_w > 24) {
+			bar = "--[ ПАУЗА ]" + string(scr_w - 12, '-');
+		}
+		else {
+			bar = string(scr_w - 1, '-');
+		}
+		ScrClearLine(user_bottom);
+		ScrPut(0, user_bottom, bar);
+	}
+
+	static void RepaintUser() {
+		if (!is_console) return;
+		int first = (u_head > user_bottom) ? (u_head - user_bottom) : 0;
+		for (int i = 0; i < user_bottom; ++i) {
+			ScrClearLine(i);
+			if (first + i < u_head) {
+				ScrPut(0, i, u_ring[(first + i) % USER_RING]);
+			}
+		}
+	}
+
+	// Извежда ред в потребителската конзола
+	static void UserLine(const string& s) {
+		if (!is_console) {
+			cout << s << "\n";
+			return;
+		}
+		u_ring[u_head % USER_RING] = s;
+		u_head++;
+		RepaintUser();
+		DrawPrompt();
+	}
+
+	// Извежда съобщение в системната конзола с префикс [VM]
+	static void SysMsg(const string& s) {
+		if (!is_console) {
+			cout << "[VM] " << s << "\n";
+			return;
+		}
+		for (int i = 0; i <= SYS_RING - 2; ++i) {
+			sys_lines[i] = sys_lines[i + 1];
+		}
+		sys_lines[SYS_RING - 1] = "[VM] " + s;
+		DrawSysArea();
+		DrawPrompt();
+	}
+
+	// Неблокиращо четене на символ от клавиатурата
+	static bool ReadCharNB(char& c) {
+		c = 0;
+		if (!is_console) return false;
+		INPUT_RECORD ir;
+		DWORD n = 0;
+		while (PeekConsoleInputA(hIn, &ir, 1, &n) && n > 0) {
+			if (!ReadConsoleInputA(hIn, &ir, 1, &n)) return false;
+			if (ir.EventType == KEY_EVENT && ir.Event.KeyEvent.bKeyDown) {
+				char ch = ir.Event.KeyEvent.uChar.AsciiChar;
+				if (ch != 0) {
+					c = ch;
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	// Четене на цял ред от командния промпт без нарушаване на екрана
+	static string ReadLineBlocking() {
+		if (!is_console) {
+			string s;
+			getline(cin, s);
+			return s;
+		}
+		line_buf = "";
+		DrawPrompt();
+		while (true) {
+			char c;
+			while (ReadCharNB(c)) {
+				if (c == '\r' || c == '\n') {
+					string res = line_buf;
+					line_buf = "";
+					DrawPrompt();
+					return res;
+				}
+				else if (c == '\b' || c == 127) {
+					if (!line_buf.empty()) line_buf.pop_back();
+					DrawPrompt();
+				}
+				else if (c == 27) { // ESC изчиства реда
+					line_buf = "";
+					DrawPrompt();
+				}
+				else if (static_cast<unsigned char>(c) >= 32) {
+					line_buf += c;
+					DrawPrompt();
+				}
+			}
+			Sleep(10);
+		}
+	}
+};
+
+// Дефиниция на статичните променливи на класа Console
+HANDLE Console::hOut = INVALID_HANDLE_VALUE;
+HANDLE Console::hIn = INVALID_HANDLE_VALUE;
+WORD Console::def_attr = 7;
+int Console::org_y = 0;
+bool Console::is_console = false;
+int Console::scr_w = 80;
+int Console::scr_h = 25;
+int Console::sys_rows = SYS_DEFAULT;
+int Console::user_bottom = 20;
+vector<string> Console::u_ring(USER_RING, "");
+int Console::u_head = 0;
+vector<string> Console::sys_lines(SYS_RING, "");
+string Console::line_buf = "";
+bool Console::paused = false;
 
 // ==========================================
 // Loader и зареждане в паметта
@@ -78,7 +331,7 @@ public:
 	static bool LoadModule(const string& filename, PCB& pcb) {
 		ifstream file(filename, ios::binary);
 		if (!file.is_open()) {
-			cerr << "Грешка: Файлът " << filename << " не може да бъде отворен!" << "\n";
+			Console::SysMsg("Грешка: Файлът " + filename + " не може да бъде отворен!");
 			return false;
 		}
 
@@ -92,34 +345,34 @@ public:
 		// 1. Четене на заглавието (думи 0-5)
 		if (!readWord(magic) || !readWord(version) || !readWord(flags) ||
 			!readWord(image_size) || !readWord(entry) || !readWord(ext_count)) {
-			cerr << "Грешка: Непълен или повреден хедър.\n";
+			Console::SysMsg("Грешка: Непълен или повреден хедър.");
 			return false;
 		}
 
 		// 2. Проверки по т. 4.2
 		int32_t expected_magic = 'V' | ('M' << 8) | ('X' << 16) | ('1' << 24);
 		if (magic != expected_magic) {
-			cerr << "Грешка: Невалидна сигнатура (очаква се VMX1).\n";
+			Console::SysMsg("Грешка: Невалидна сигнатура (очаква се VMX1).");
 			return false;
 		}
 
 		if (version != 1) {
-			cerr << "Грешка: Неподдържана версия.\n";
+			Console::SysMsg("Грешка: Неподдържана версия.");
 			return false;
 		}
 
 		if (image_size <= 0 || image_size > MEM_SIZE) {
-			cerr << "Грешка: Невалиден общ размер на модула: " << image_size << " думи.\n";
+			Console::SysMsg("Грешка: Невалиден общ размер на модула: " + to_string(image_size) + " думи.");
 			return false;
 		}
 
 		if (entry < 0 || entry >= image_size) {
-			cerr << "Грешка: Невалидна входна точка (entry).\n";
+			Console::SysMsg("Грешка: Невалидна входна точка (entry).");
 			return false;
 		}
 
 		if (ext_count < 0 || ext_count > MAX_EXT) {
-			cerr << "Грешка: Невалиден брой външни имена: " << ext_count << "\n";
+			Console::SysMsg("Грешка: Невалиден брой външни имена: " + to_string(ext_count));
 			return false;
 		}
 
@@ -127,16 +380,17 @@ public:
 		pcb.image.resize(image_size);
 		for (int32_t i = 0; i < image_size; ++i) {
 			if (!readWord(pcb.image[i])) {
-				cerr << "Грешка: Файлът е твърде къс (липсват данни за образеца).\n";
+				Console::SysMsg("Грешка: Файлът е твърде къс (липсват данни за образеца).");
 				return false;
 			}
 		}
 
 		// 4. Четене на таблицата с външни имена
+		pcb.xlat.clear();
 		for (int32_t k = 0; k < ext_count; ++k) {
 			int32_t kind, len;
 			if (!readWord(kind) || !readWord(len)) {
-				cerr << "Грешка: Отрязана таблица с външни имена.\n";
+				Console::SysMsg("Грешка: Отрязана таблица с външни имена.");
 				return false;
 			}
 
@@ -144,14 +398,14 @@ public:
 			for (int32_t i = 0; i < len; ++i) {
 				int32_t char_word;
 				if (!readWord(char_word)) {
-					cerr << "Грешка: Отрязано име в таблицата.\n";
+					Console::SysMsg("Грешка: Отрязано име в таблицата.");
 					return false;
 				}
 				ext_name += static_cast<char>(char_word & 0xFF);
 			}
 
-			// Забележка: В Седмица 12 тук ще се попълва векторът xlat 
-			// и ще се прави връзка със системните таблици.
+			// Забележка: В Седмица 12 тук ще се прави реална връзка със системните таблици.
+			pcb.xlat.push_back({ (kind == 1) ? EK_SHARED : EK_SEM, 0 });
 		}
 
 		pcb.image_size = image_size;
@@ -168,6 +422,7 @@ public:
 
 		if (allocated_base + pcb.image_size > MEM_SIZE) {
 			pcb.state = PS_WAIT_MEM;
+			Console::SysMsg("[" + to_string(pcb.pid) + "] " + pcb.module_name + ": недостатъчна памет - чака");
 			return false;
 		}
 
@@ -183,8 +438,8 @@ public:
 		pcb.acc = 0;
 		pcb.state = PS_READY;
 
-		cout << "[VM] " << pcb.module_name << " стартиран, "
-			<< pcb.image_size << " думи, PC = " << pcb.pc << "\n";
+		Console::SysMsg("[" + to_string(pcb.pid) + "] " + pcb.module_name + " стартиран, " +
+			to_string(pcb.image_size) + " думи, PC = " + to_string(pcb.pc));
 
 		// Освобождаване на временния буфер
 		pcb.image.clear();
@@ -229,7 +484,11 @@ public:
 	// Функция за обработка на грешки по време на изпълнение
 	static void RuntimeError(PCB& pcb, const string& msg, int32_t pc_error) {
 		int32_t offset = pc_error - pcb.base;
-		cerr << "[VM] [" << pcb.pid << "] Грешка при изпълнение: " << msg << " (Отместване: " << offset << ")\n";
+		if (!pcb.out_buf.empty()) {
+			Console::UserLine("[" + to_string(pcb.pid) + "] " + pcb.out_buf);
+			pcb.out_buf = "";
+		}
+		Console::SysMsg("[" + to_string(pcb.pid) + "] Грешка при изпълнение: " + msg + " (Отместване: " + to_string(offset) + ")");
 
 		pcb.state = PS_DONE;
 	}
@@ -259,11 +518,13 @@ public:
 
 		// Режим на трасиране
 		if (trace_on) {
-			cout << "[" << pcb.pid << "] trace "
+			stringstream ss;
+			ss << "[" << pcb.pid << "] trace "
 				<< right << setw(4) << (orig_pc - pcb.base) << ": "
 				<< left << setw(7) << MnemOf(op) << " "
 				<< right << setw(5) << opd
-				<< "   ACC=" << pcb.acc << "\n";
+				<< "   ACC=" << pcb.acc;
+			Console::UserLine(ss.str());
 		}
 
 		// Помощна функция за проверка дали адресът е извън блока на процеса
@@ -297,7 +558,7 @@ public:
 			// Контрол на външните имена (LDS, STS, SEMINIT, WAIT, SIGNAL)
 		case 0x13: case 0x14: case 0x60: case 0x62: case 0x63:
 			// Проверка: Невалиден индекс на външно име
-			if (opd < 0 || opd >= pcb.xlat.size()) {
+			if (opd < 0 || opd >= static_cast<int32_t>(pcb.xlat.size())) {
 				RuntimeError(pcb, "Невалиден индекс на външно име!", orig_pc);
 				return false;
 			}
@@ -318,6 +579,7 @@ public:
 				return false;
 			}
 			break;
+
 			// Аритметични операции
 		case 0x20: // ADD
 			if ((addr = getValidAddress(opd)) == -1) return false;
@@ -406,26 +668,38 @@ public:
 			break;
 
 			// Вход / Изход
-		case 0x50: // IN
+		case 0x50: { // IN
 			// Ако имаме текст в буфера (например подкана "Въведи N: "), го извеждаме
 			if (!pcb.out_buf.empty()) {
-				cout << "[" << pcb.pid << "] " << pcb.out_buf << "\n";
+				Console::UserLine("[" + to_string(pcb.pid) + "] " + pcb.out_buf);
 				pcb.out_buf = "";
 			}
-			cout << "[" << pcb.pid << "] Въведете стойност: ";
-			cin >> pcb.acc;
+			Console::UserLine("[" + to_string(pcb.pid) + "] Въведете стойност: ");
+			Console::SysMsg("[" + to_string(pcb.pid) + "] блокиран по вход");
+
+			string in_str = Console::ReadLineBlocking();
+			try {
+				pcb.acc = stoi(in_str);
+			}
+			catch (...) {
+				pcb.acc = 0;
+			}
+
+			Console::UserLine("[" + to_string(pcb.pid) + "] вход: " + to_string(pcb.acc));
+			Console::SysMsg("[" + to_string(pcb.pid) + "] деблокиран след вход");
 
 			if (trace_on) {
-				cout << "      -> Прочетена стойност: " << pcb.acc << "\n";
+				Console::UserLine("      -> Прочетена стойност: " + to_string(pcb.acc));
 			}
 			break;
+		}
 		case 0x51: // OUT (Извежда десетично число)
 			pcb.out_buf += to_string(pcb.acc);
 			break;
 		case 0x52: // OUTC (Извежда ASCII символ)
 			if (pcb.acc == 10 || pcb.acc == 13) {
 				// Код 10 (или 13) затваря реда и го извежда
-				cout << "[" << pcb.pid << "] " << pcb.out_buf << "\n";
+				Console::UserLine("[" + to_string(pcb.pid) + "] " + pcb.out_buf);
 				pcb.out_buf = "";
 			}
 			else if (pcb.acc >= 32 && pcb.acc < 127) {
@@ -461,11 +735,11 @@ public:
 
 		// Ако има останал текст в буфера при завършване на програмата
 		if (!pcb.out_buf.empty()) {
-			cout << "[" << pcb.pid << "] " << pcb.out_buf << "\n";
+			Console::UserLine("[" + to_string(pcb.pid) + "] " + pcb.out_buf);
 			pcb.out_buf = "";
 		}
 
-		cout << "[VM] [" << pcb.pid << "] завършен, изпълнени " << pcb.instr_count << " инструкции.\n";
+		Console::SysMsg("[" + to_string(pcb.pid) + "] завършен, изпълнени " + to_string(pcb.instr_count) + " инструкции.");
 	}
 };
 
@@ -488,6 +762,11 @@ int main(int argc, char* argv[]) {
 		}
 	}
 
+	Console::Init();
+	Console::UserLine("Виртуална машина VM(L) – потребителска конзола");
+	Console::UserLine("Изходът на процесите се появява тук, маркиран с техния идентификатор.");
+	Console::UserLine("");
+
 	PCB process1;
 	process1.pid = 1;
 	process1.instr_count = 0; // Инициализация
@@ -498,6 +777,10 @@ int main(int argc, char* argv[]) {
 			CPU::RunProcess(process1);
 		}
 	}
+
+	Console::SysMsg("Натиснете Enter за изход...");
+	Console::ReadLineBlocking();
+	Console::Done();
 
 	return 0;
 }
