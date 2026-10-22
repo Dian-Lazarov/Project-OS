@@ -128,6 +128,7 @@ public:
 	static vector<string> sys_lines;
 	static string line_buf;
 	static bool paused;
+	static int u_scroll; // Отместване при превъртане (0 = най-долу)
 
 	// Инициализация и проверка какво поддържа средата
 	static void Init() {
@@ -135,6 +136,8 @@ public:
 		hIn = GetStdHandle(STD_INPUT_HANDLE);
 		def_attr = 7;
 		org_y = 0;
+		u_head = 0;
+		u_scroll = 0; // Нулираме скрола
 
 		CONSOLE_SCREEN_BUFFER_INFO bi;
 		// Проверка дали средата поддържа конзолен екран
@@ -252,12 +255,30 @@ public:
 
 	static void RepaintUser() {
 		if (!is_console) return;
-		int first = (u_head > user_bottom) ? (u_head - user_bottom) : 0;
+
+		// Ограничаваме максималното скролване до наличните редове в буфера
+		int total_lines = (u_head < USER_RING) ? u_head : USER_RING;
+		int max_scroll = total_lines - user_bottom;
+		if (max_scroll < 0) max_scroll = 0;
+
+		if (u_scroll > max_scroll) u_scroll = max_scroll;
+		if (u_scroll < 0) u_scroll = 0;
+
+		// Изчисляваме индекса на първия видим ред
+		int first = (u_head > user_bottom) ? (u_head - user_bottom - u_scroll) : 0;
+		if (first < 0) first = 0;
+
 		for (int i = 0; i < user_bottom; ++i) {
 			ScrClearLine(i);
 			if (first + i < u_head) {
 				ScrPut(0, i, u_ring[(first + i) % USER_RING]);
 			}
+		}
+
+		// Добавяме индикатор в горния десен ъгъл, ако потребителят е скролнал нагоре
+		if (u_scroll > 0) {
+			string ind = "[Скрол: " + to_string(u_scroll) + "]";
+			ScrPut(scr_w - ind.length() - 1, 0, ind);
 		}
 	}
 
@@ -269,6 +290,7 @@ public:
 		}
 		u_ring[u_head % USER_RING] = s;
 		u_head++;
+		u_scroll = 0; // Автоматично връщане най-долу при нов изход
 		RepaintUser();
 		DrawPrompt();
 	}
@@ -296,8 +318,28 @@ public:
 		while (PeekConsoleInputA(hIn, &ir, 1, &n) && n > 0) {
 			if (!ReadConsoleInputA(hIn, &ir, 1, &n)) return false;
 			if (ir.EventType == KEY_EVENT && ir.Event.KeyEvent.bKeyDown) {
+				WORD vk = ir.Event.KeyEvent.wVirtualKeyCode;
 				char ch = ir.Event.KeyEvent.uChar.AsciiChar;
-				if (ch != 0) {
+
+				// Прехващане на клавишите за скролване
+				if (vk == VK_PRIOR) { // Page Up
+					u_scroll += user_bottom - 1;
+					RepaintUser();
+				}
+				else if (vk == VK_NEXT) { // Page Down
+					u_scroll -= user_bottom - 1;
+					RepaintUser();
+				}
+				else if (vk == VK_UP) { // Arrow Up
+					u_scroll += 1;
+					RepaintUser();
+				}
+				else if (vk == VK_DOWN) { // Arrow Down
+					u_scroll -= 1;
+					RepaintUser();
+				}
+				// Нормален символ
+				else if (ch != 0) {
 					c = ch;
 					return true;
 				}
@@ -400,6 +442,7 @@ vector<string> Console::sys_lines(SYS_RING, "");
 string Console::line_buf = "";
 bool Console::paused = false;
 vector<string> Console::overlay_buf;
+int Console::u_scroll = 0;
 
 // ==========================================
 // Loader и зареждане в паметта
