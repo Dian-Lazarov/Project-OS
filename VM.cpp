@@ -19,6 +19,7 @@ const int32_t MAX_EXT = 32;    // Максимален брой външни имена
 const int32_t USER_RING = 400; // Кръгов буфер за потребителската конзола
 const int32_t SYS_RING = 20;   // Буфер за системната конзола
 const int32_t SYS_DEFAULT = 3; // Видими системни редове по подразбиране
+const int32_t MAX_PROCS = 32;  // Максимален брой процеси
 
 // Състояния на процеса
 enum ProcessState {
@@ -45,7 +46,9 @@ struct Xlat {
 
 // Блок за управление на процес (PCB)
 struct PCB {
-	int32_t pid = 1;
+	bool used = false; // Маркер дали слотът е свободен
+
+	int32_t pid = 0;
 	string module_name;
 	ProcessState state = PS_NEW;
 
@@ -68,6 +71,40 @@ struct PCB {
 
 // Глобална памет (модел на реалната памет)
 vector<int32_t> Memory(MEM_SIZE, 0);
+
+// Глобална таблица на процесите
+vector<PCB> Procs(MAX_PROCS + 1); // Индексираме от 1 до 32
+int32_t next_pid = 1;
+
+// Намира свободен слот в таблицата
+int FindFreeSlot() {
+	for (int i = 1; i <= MAX_PROCS; ++i) {
+		if (!Procs[i].used) return i;
+	}
+	return 0;
+}
+
+// Намира индекс по даден PID
+int FindSlotByPid(int32_t pid) {
+	for (int i = 1; i <= MAX_PROCS; ++i) {
+		if (Procs[i].used && Procs[i].pid == pid) return i;
+	}
+	return 0;
+}
+
+// Помощна функция за конвертиране на състояние в текст
+string StateStr(ProcessState s) {
+	switch (s) {
+	case PS_NEW: return "нов";
+	case PS_WAIT_MEM: return "чакащ памет";
+	case PS_READY: return "готов";
+	case PS_RUNNING: return "изпълняван";
+	case PS_BLOCKED_SEM: return "блокиран (семафор)";
+	case PS_BLOCKED_IN: return "блокиран (вход)";
+	case PS_DONE: return "завършил";
+	default: return "-";
+	}
+}
 
 // =================================================================
 // Управление на двете конзоли (системна + потребителска)
@@ -303,6 +340,48 @@ public:
 			Sleep(10);
 		}
 	}
+
+	static vector<string> overlay_buf;
+
+	// Изчиства буфера за пълноекранен изглед
+	static void OvClear() {
+		overlay_buf.clear();
+	}
+
+	// Добавя ред към пълноекранния изглед
+	static void OvAdd(const string& s) {
+		overlay_buf.push_back(s);
+	}
+
+	// Показва пълноекранния изглед, чака клавиш и възстановява конзолите
+	static void OvShow() {
+		if (!is_console) {
+			for (const string& s : overlay_buf) cout << s << "\n";
+			return;
+		}
+
+		ScrClearAll();
+		for (size_t i = 0; i < overlay_buf.size(); ++i) {
+			if (i < scr_h - 1) { // Оставяме последния ред за подканата
+				ScrPut(0, i, overlay_buf[i]);
+			}
+		}
+
+		ScrPut(0, scr_h - 1, "-- Натиснете произволен клавиш --");
+
+		// Изчакваме натискане на клавиш
+		char c;
+		while (!ReadCharNB(c)) {
+			Sleep(20);
+		}
+
+		// Възстановяваме стандартния изглед на двете конзоли
+		ScrClearAll();
+		RepaintUser();
+		DrawSeparator();
+		DrawSysArea();
+		DrawPrompt();
+	}
 };
 
 // Дефиниция на статичните променливи на класа Console
@@ -320,11 +399,11 @@ int Console::u_head = 0;
 vector<string> Console::sys_lines(SYS_RING, "");
 string Console::line_buf = "";
 bool Console::paused = false;
+vector<string> Console::overlay_buf;
 
 // ==========================================
 // Loader и зареждане в паметта
 // ==========================================
-
 class Loader {
 public:
 	// Функция за четене на .vmx модул и валидация
@@ -743,44 +822,136 @@ public:
 	}
 };
 
+// Процедура, обработваща въведената команда в системния промпт
+void ProcessCommand(const string& line) {
+	if (line.empty()) return;
+
+	istringstream iss(line);
+	string cmd;
+	iss >> cmd;
+
+	if (cmd == "quit" || cmd == "exit") {
+		Console::SysMsg("Излизане...");
+		exit(0);
+	}
+	else if (cmd == "run") {
+		string filename;
+		iss >> filename;
+
+		if (filename.empty()) {
+			Console::SysMsg("Употреба: run <module.vmx>");
+			return;
+		}
+
+		// Проверка за разширение
+		if (filename.find(".vmx") == string::npos) filename += ".vmx";
+
+		int slot = FindFreeSlot();
+		if (slot == 0) {
+			Console::SysMsg("Грешка: Няма свободни слотове за процеси (MAX_PROCS достигнат).");
+			return;
+		}
+
+		// Инициализация на новия PCB
+		Procs[slot] = PCB();
+		Procs[slot].used = true;
+		Procs[slot].pid = next_pid++;
+		Procs[slot].module_name = filename;
+		Procs[slot].state = PS_NEW;
+
+		if (Loader::LoadModule(filename, Procs[slot])) {
+			// Loader::AllocateAndStart сменя състоянието на PS_READY
+			if (Loader::AllocateAndStart(Procs[slot])) {
+				// ВРЕМЕННО ЗА СЕДМИЦА 7: Изпълняваме процеса веднага, 
+				// тъй като диспечерът (RunSlice) все още не е реализиран.
+				CPU::RunProcess(Procs[slot]);
+			}
+		}
+		else {
+			Procs[slot].used = false; // Освобождаваме слота при грешка
+		}
+	}
+	else if (cmd == "kill") {
+		int32_t pid;
+		if (!(iss >> pid)) {
+			Console::SysMsg("Употреба: kill <pid>");
+			return;
+		}
+		int slot = FindSlotByPid(pid);
+		if (slot == 0) {
+			Console::SysMsg("Не е намерен процес с PID " + to_string(pid));
+			return;
+		}
+
+		// В Седмица 8 тук ще има освобождаване на памет
+		Procs[slot].state = PS_DONE;
+		Procs[slot].used = false;
+		Console::SysMsg("Процес [" + to_string(pid) + "] беше принудително прекратен.");
+	}
+	else if (cmd == "proc" || cmd == "ps") {
+		// Показва всички процеси на цял екран
+		Console::OvClear();
+		Console::OvAdd("Таблица на процесите");
+		Console::OvAdd("");
+		Console::OvAdd(" PID  Модул            Състояние");
+		Console::OvAdd(" ---------------------------------------------------");
+
+		for (int i = 1; i <= MAX_PROCS; ++i) {
+			if (Procs[i].used) {
+				stringstream ss;
+				ss << right << setw(4) << Procs[i].pid << "  "
+					<< left << setw(16) << Procs[i].module_name
+					<< " " << StateStr(Procs[i].state);
+				Console::OvAdd(ss.str());
+			}
+		}
+		Console::OvShow();
+	}
+	else if (cmd == "ready") {
+		// Показва само готовите за изпълнение
+		Console::OvClear();
+		Console::OvAdd("Опашка на готовите процеси");
+		Console::OvAdd("");
+
+		bool found = false;
+		for (int i = 1; i <= MAX_PROCS; ++i) {
+			if (Procs[i].used && Procs[i].state == PS_READY) {
+				Console::OvAdd(" [" + to_string(Procs[i].pid) + "] " + Procs[i].module_name);
+				found = true;
+			}
+		}
+		if (!found) Console::OvAdd(" Опашката е празна.");
+
+		Console::OvShow();
+	}
+	else {
+		Console::SysMsg("Непозната команда: " + cmd + " (достъпни: run, kill, proc, ready, quit)");
+	}
+}
+
 int main(int argc, char* argv[]) {
 	system("chcp 1251 > nul");
 
-	if (argc < 2) {
-		cerr << "Употреба: " << argv[0] << " <module.vmx> [-t]\n";
-		cerr << "  -t : Включване на режим на трасиране\n";
-		return 1;
-	}
-
-	string filename = argv[1];
-
-	// Проверка за наличие на флаг -t
-	if (argc >= 3) {
-		string flag = argv[2];
-		if (flag == "-t") {
-			trace_on = true;
-		}
+	// Инициализация на празни слотове
+	for (int i = 1; i <= MAX_PROCS; ++i) {
+		Procs[i].used = false;
 	}
 
 	Console::Init();
 	Console::UserLine("Виртуална машина VM(L) – потребителска конзола");
 	Console::UserLine("Изходът на процесите се появява тук, маркиран с техния идентификатор.");
 	Console::UserLine("");
+	Console::SysMsg("Системата е готова.");
 
-	PCB process1;
-	process1.pid = 1;
-	process1.instr_count = 0; // Инициализация
+	// Основен цикъл на ОС (Засега само обработва команди)
+	while (true) {
+		string line = Console::ReadLineBlocking();
+		Console::SysMsg("> " + line); // Ехо на командата в системния лог
+		ProcessCommand(line);
 
-	if (Loader::LoadModule(filename, process1)) {
-		if (Loader::AllocateAndStart(process1)) {
-			// Стартираме главния цикъл за изпълнение
-			CPU::RunProcess(process1);
-		}
+		// (Забележка: В Седмица 9 тук ще добавим извикването към 
+		// диспечера - CPU::RunSlice, който ще избира процес от Ready опашката)
 	}
-
-	Console::SysMsg("Натиснете Enter за изход...");
-	Console::ReadLineBlocking();
-	Console::Done();
 
 	return 0;
 }
