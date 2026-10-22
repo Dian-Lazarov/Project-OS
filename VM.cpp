@@ -531,6 +531,7 @@ public:
 // Цикъл извличане-декодиране-изпълнение на инструкция
 // ==========================================================
 bool trace_on = false; // Глобален флаг за режима на трасиране
+int32_t trace_pid = 0; // 0 = всички процеси, иначе конкретен PID
 
 class CPU {
 public:
@@ -595,8 +596,8 @@ public:
 			opd = Memory[pcb.pc++];
 		}
 
-		// Режим на трасиране
-		if (trace_on) {
+		// Режим на трасиране (всички процеси или само текущия)
+		if (trace_on && (trace_pid == 0 || trace_pid == pcb.pid)) {
 			stringstream ss;
 			ss << "[" << pcb.pid << "] trace "
 				<< right << setw(4) << (orig_pc - pcb.base) << ": "
@@ -767,7 +768,7 @@ public:
 			Console::UserLine("[" + to_string(pcb.pid) + "] вход: " + to_string(pcb.acc));
 			Console::SysMsg("[" + to_string(pcb.pid) + "] деблокиран след вход");
 
-			if (trace_on) {
+			if (trace_on && (trace_pid == 0 || trace_pid == pcb.pid)) {
 				Console::UserLine("      -> Прочетена стойност: " + to_string(pcb.acc));
 			}
 			break;
@@ -924,8 +925,35 @@ void ProcessCommand(const string& line) {
 
 		Console::OvShow();
 	}
+	else if (cmd == "trace") {
+		string arg;
+		iss >> arg;
+
+		if (arg == "on") {
+			trace_on = true;
+			trace_pid = 0;
+			Console::SysMsg("Трасирането е включено за всички процеси.");
+		}
+		else if (arg == "off") {
+			trace_on = false;
+			Console::SysMsg("Трасирането е изключено.");
+		}
+		else if (!arg.empty()) {
+			try {
+				trace_pid = stoi(arg);
+				trace_on = true;
+				Console::SysMsg("Трасирането е включено за процес " + to_string(trace_pid));
+			}
+			catch (...) {
+				Console::SysMsg("Употреба: trace on|off|<pid>");
+			}
+		}
+		else {
+			Console::SysMsg("Употреба: trace on|off|<pid>");
+		}
+	}
 	else {
-		Console::SysMsg("Непозната команда: " + cmd + " (достъпни: run, kill, proc, ready, quit)");
+		Console::SysMsg("Непозната команда: " + cmd + " (достъпни: run, kill, trace, proc, ready, quit)");
 	}
 }
 
