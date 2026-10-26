@@ -75,6 +75,8 @@ vector<int32_t> Memory(MEM_SIZE, 0);
 // Глобална таблица на процесите
 vector<PCB> Procs(MAX_PROCS + 1); // Индексираме от 1 до 32
 int32_t next_pid = 1;
+int cur_slot = 0;       // Слотът на текущо изпълнявания процес
+bool is_running = true; // Флаг за работа на виртуалната машина
 
 // Намира свободен слот в таблицата
 int FindFreeSlot() {
@@ -847,22 +849,46 @@ public:
 		return true;
 	}
 
-	// Изпълнява инструкции, докато процесът не завърши (Ниво A)
-	static void RunProcess(PCB& pcb) {
-		pcb.state = PS_RUNNING;
-		while (pcb.state == PS_RUNNING) {
-			if (!ExecOne(pcb)) {
-				break;
+	// Помощна функция: намира първия готов процес
+	static int PickNext() {
+		for (int i = 1; i <= MAX_PROCS; ++i) {
+			if (Procs[i].used && Procs[i].state == PS_READY) return i;
+		}
+		return 0;
+	}
+
+	// Изпълнява порция инструкции и връща управлението
+	static void RunSlice() {
+		if (cur_slot == 0) {
+			cur_slot = PickNext();
+			if (cur_slot == 0) return; // Няма готови процеси
+		}
+
+		// Проверка дали процесът все още е валиден
+		if (!Procs[cur_slot].used || (Procs[cur_slot].state != PS_READY && Procs[cur_slot].state != PS_RUNNING)) {
+			cur_slot = 0;
+			return;
+		}
+
+		Procs[cur_slot].state = PS_RUNNING;
+		int n = 0;
+		const int CONSOLE_SLICE = 300; // Брой инструкции, преди да проверим конзолата
+
+		while (n < CONSOLE_SLICE && Procs[cur_slot].used && Procs[cur_slot].state == PS_RUNNING) {
+			if (!ExecOne(Procs[cur_slot])) {
+				break; // Процесът приключи, блокира или даде грешка
 			}
+			n++;
 		}
 
-		// Ако има останал текст в буфера при завършване на програмата
-		if (!pcb.out_buf.empty()) {
-			Console::UserLine("[" + to_string(pcb.pid) + "] " + pcb.out_buf);
-			pcb.out_buf = "";
+		// Ако процесът все още работи, го връщаме в PS_READY, за да може главният цикъл
+		// да обработи конзолата, след което PickNext отново ще го избере.
+		if (Procs[cur_slot].used && Procs[cur_slot].state == PS_RUNNING) {
+			Procs[cur_slot].state = PS_READY;
 		}
-
-		Console::SysMsg("[" + to_string(pcb.pid) + "] завършен, изпълнени " + to_string(pcb.instr_count) + " инструкции.");
+		else {
+			cur_slot = 0;
+		}
 	}
 };
 
@@ -875,8 +901,8 @@ void ProcessCommand(const string& line) {
 	iss >> cmd;
 
 	if (cmd == "quit" || cmd == "exit") {
-		Console::SysMsg("Излизане...");
-		exit(0);
+		is_running = false; // Спираме главния цикъл
+		return;
 	}
 	else if (cmd == "run") {
 		string filename;
@@ -904,12 +930,8 @@ void ProcessCommand(const string& line) {
 		Procs[slot].state = PS_NEW;
 
 		if (Loader::LoadModule(filename, Procs[slot])) {
-			// Loader::AllocateAndStart сменя състоянието на PS_READY
-			if (Loader::AllocateAndStart(Procs[slot])) {
-				// ВРЕМЕННО ЗА СЕДМИЦА 7: Изпълняваме процеса веднага, 
-				// тъй като диспечерът (RunSlice) все още не е реализиран.
-				CPU::RunProcess(Procs[slot]);
-			}
+			// Сменя състоянието на PS_READY
+			(Loader::AllocateAndStart(Procs[slot]));
 		}
 		else {
 			Procs[slot].used = false; // Освобождаваме слота при грешка
@@ -927,9 +949,10 @@ void ProcessCommand(const string& line) {
 			return;
 		}
 
-		// В Седмица 8 тук ще има освобождаване на памет
+		// Освобождаване на паметта
 		Procs[slot].state = PS_DONE;
 		Procs[slot].used = false;
+		if (slot == cur_slot) cur_slot = 0; // Освобождаваме процесора веднага, ако убиваме активния процес
 		Console::SysMsg("Процес [" + to_string(pid) + "] беше принудително прекратен.");
 	}
 	else if (cmd == "proc" || cmd == "ps") {
@@ -1014,14 +1037,40 @@ int main(int argc, char* argv[]) {
 	Console::UserLine("");
 	Console::SysMsg("Системата е готова.");
 
-	// Основен цикъл на ОС (Засега само обработва команди)
-	while (true) {
-		string line = Console::ReadLineBlocking();
-		Console::SysMsg("> " + line); // Ехо на командата в системния лог
-		ProcessCommand(line);
+	// Основен цикъл на ОС
+	while (is_running) {
+		// 1. Споделяне на времето с процесора (изпълнява се част от програмата)
+		CPU::RunSlice();
 
-		// (Забележка: В Седмица 9 тук ще добавим извикването към 
-		// диспечера - CPU::RunSlice, който ще избира процес от Ready опашката)
+		// 2. Неблокиращо четене от клавиатурата за системната конзола
+		char c;
+		while (Console::ReadCharNB(c)) {
+			if (c == '\r' || c == '\n') {
+				if (!Console::line_buf.empty()) {
+					Console::SysMsg("> " + Console::line_buf);
+					ProcessCommand(Console::line_buf);
+					Console::line_buf = "";
+				}
+				Console::DrawPrompt();
+			}
+			else if (c == '\b' || c == 127) {
+				if (!Console::line_buf.empty()) Console::line_buf.pop_back();
+				Console::DrawPrompt();
+			}
+			else if (c == 27) { // ESC изчиства реда
+				Console::line_buf = "";
+				Console::DrawPrompt();
+			}
+			else if (static_cast<unsigned char>(c) >= 32) {
+				Console::line_buf += c;
+				Console::DrawPrompt();
+			}
+		}
+
+		// 3. Ако системата бездейства (няма готови процеси), приспиваме леко за пестене на CPU ресурс
+		if (cur_slot == 0 && CPU::PickNext() == 0) {
+			Sleep(5);
+		}
 	}
 
 	return 0;
