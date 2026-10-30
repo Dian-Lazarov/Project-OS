@@ -72,6 +72,81 @@ struct PCB {
 // Глобална памет (модел на реалната памет)
 vector<int32_t> Memory(MEM_SIZE, 0);
 
+// Структура за свободен блок памет
+struct FreeBlk {
+	int32_t base;
+	int32_t size;
+};
+
+const int32_t MAX_FREE = 64;
+vector<FreeBlk> FreeB(MAX_FREE);
+int32_t free_count = 0;
+
+// Инициализация на паметта (един голям свободен блок)
+void MemInit() {
+	free_count = 1;
+	FreeB[0].base = 0;
+	FreeB[0].size = MEM_SIZE;
+	fill(Memory.begin(), Memory.end(), 0);
+}
+
+bool MemAlloc(int32_t size, int32_t& base) {
+	if (size <= 0) return false;
+	base = -1;
+	int pick = -1;
+
+	// Търсене по стратегия First Fit
+	for (int i = 0; i < free_count; ++i) {
+		if (FreeB[i].size >= size) {
+			pick = i;
+			break;
+		}
+	}
+
+	if (pick < 0) return false; // Няма достатъчно памет
+
+	base = FreeB[pick].base;
+
+	// Ако блокът е точно колкото ни трябва, го премахваме от списъка
+	if (FreeB[pick].size == size) {
+		for (int i = pick; i < free_count - 1; ++i) {
+			FreeB[i] = FreeB[i + 1];
+		}
+		free_count--;
+	}
+	// Иначе просто намаляваме размера му и местим базата напред
+	else {
+		FreeB[pick].base += size;
+		FreeB[pick].size -= size;
+	}
+
+	return true;
+}
+
+// Освобождаване на паметта
+void MemFree(int32_t base, int32_t size) {
+	if (size <= 0 || free_count >= MAX_FREE) return;
+
+	// Намираме правилната позиция за вмъкване, за да държим списъка сортиран по адрес
+	int pos = free_count;
+	for (int i = 0; i < free_count; ++i) {
+		if (FreeB[i].base > base) {
+			pos = i;
+			break;
+		}
+	}
+
+	// Отместваме останалите блокове
+	for (int i = free_count; i > pos; --i) {
+		FreeB[i] = FreeB[i - 1];
+	}
+
+	// Вмъкваме новия свободен блок
+	FreeB[pos].base = base;
+	FreeB[pos].size = size;
+	free_count++;
+}
+
 // Глобална таблица на процесите
 vector<PCB> Procs(MAX_PROCS + 1); // Индексираме от 1 до 32
 int32_t next_pid = 1;
@@ -541,10 +616,11 @@ public:
 
 	// Симулация на заемане на памет за 1 процес (Ниво А / Седмица 2)
 	static bool AllocateAndStart(PCB& pcb) {
-		// В Седмица 2 разпределянето на паметта е най-опростено - зареждаме на адрес 0
-		int32_t allocated_base = 0;
+		// Разпределяне на паметта
+		int32_t allocated_base;
 
-		if (allocated_base + pcb.image_size > MEM_SIZE) {
+		// Опит за заемане на памет
+		if (!MemAlloc(pcb.image_size, allocated_base)) {
 			pcb.state = PS_WAIT_MEM;
 			Console::SysMsg("[" + to_string(pcb.pid) + "] " + pcb.module_name + ": недостатъчна памет - чака");
 			return false;
@@ -563,7 +639,7 @@ public:
 		pcb.state = PS_READY;
 
 		Console::SysMsg("[" + to_string(pcb.pid) + "] " + pcb.module_name + " стартиран, " +
-			to_string(pcb.image_size) + " думи, PC = " + to_string(pcb.pc));
+			to_string(pcb.image_size) + " думи, база " + to_string(pcb.base));
 
 		// Освобождаване на временния буфер
 		pcb.image.clear();
@@ -571,6 +647,16 @@ public:
 		return true;
 	}
 };
+
+// Помощна функция за стартиране на чакащите процеси при наличие на свободна памет
+void RetryWaiting() {
+	for (int i = 1; i <= MAX_PROCS; ++i) {
+		if (Procs[i].used && Procs[i].state == PS_WAIT_MEM) {
+			// Ако AllocateAndStart успее, процесът минава в PS_READY
+			Loader::AllocateAndStart(Procs[i]);
+		}
+	}
+}
 
 // ==========================================================
 // Цикъл извличане-декодиране-изпълнение на инструкция
@@ -615,7 +701,10 @@ public:
 		}
 		Console::SysMsg("[" + to_string(pcb.pid) + "] Грешка при изпълнение: " + msg + " (Отместване: " + to_string(offset) + ")");
 
+		// Освобождаване на паметта
+		MemFree(pcb.base, pcb.image_size);
 		pcb.state = PS_DONE;
+		RetryWaiting();
 	}
 
 	// Изпълнение на една единствена инструкция
@@ -667,7 +756,15 @@ public:
 
 		switch (op) {
 		case 0x00: // HALT
+			if (!pcb.out_buf.empty()) {
+				Console::UserLine("[" + to_string(pcb.pid) + "] " + pcb.out_buf);
+				pcb.out_buf = "";
+			}
+			// Освобождаване на паметта
+			MemFree(pcb.base, pcb.image_size);
 			pcb.state = PS_DONE;
+			Console::SysMsg("[" + to_string(pcb.pid) + "] завършен, изпълнени " + to_string(pcb.instr_count) + " инструкции.");
+			RetryWaiting();
 			return false;
 
 			// Работа с локална памет
@@ -948,12 +1045,16 @@ void ProcessCommand(const string& line) {
 			Console::SysMsg("Не е намерен процес с PID " + to_string(pid));
 			return;
 		}
+		if (Procs[slot].state != PS_WAIT_MEM) {
+			MemFree(Procs[slot].base, Procs[slot].image_size);
+		}
 
 		// Освобождаване на паметта
 		Procs[slot].state = PS_DONE;
 		Procs[slot].used = false;
 		if (slot == cur_slot) cur_slot = 0; // Освобождаваме процесора веднага, ако убиваме активния процес
 		Console::SysMsg("Процес [" + to_string(pid) + "] беше принудително прекратен.");
+		RetryWaiting();
 	}
 	else if (cmd == "proc" || cmd == "ps") {
 		// Показва всички процеси на цял екран
@@ -1032,10 +1133,13 @@ int main(int argc, char* argv[]) {
 	}
 
 	Console::Init();
-	Console::UserLine("Виртуална машина VM(L) – потребителска конзола");
+	Console::UserLine("Виртуална машина VM(Linklang) – потребителска конзола");
 	Console::UserLine("Изходът на процесите се появява тук, маркиран с техния идентификатор.");
 	Console::UserLine("");
 	Console::SysMsg("Системата е готова.");
+
+	// Инициализация на паметта
+	MemInit();
 
 	// Основен цикъл на ОС
 	while (is_running) {
