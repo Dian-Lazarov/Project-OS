@@ -16,7 +16,7 @@ using namespace std;
 
 const int32_t MEM_SIZE = 2048; // Лимит на потребителската памет в думи
 const int32_t MAX_EXT = 32;    // Максимален брой външни имена
-const int32_t USER_RING = 400; // Кръгов буфер за потребителската конзола
+const int32_t USER_RING = 1000000; // Кръгов буфер за потребителската конзола
 const int32_t SYS_RING = 20;   // Буфер за системната конзола
 const int32_t SYS_DEFAULT = 3; // Видими системни редове по подразбиране
 const int32_t MAX_PROCS = 32;  // Максимален брой процеси
@@ -31,6 +31,22 @@ enum ProcessState {
 	PS_BLOCKED_IN,
 	PS_DONE
 };
+
+// Стратегии за диспечиране
+enum PolicyType {
+	PO_FIFO,
+	PO_SJF
+};
+
+PolicyType current_policy = PO_FIFO;
+
+string PolicyStr() {
+	switch (current_policy) {
+	case PO_FIFO: return "fifo";
+	case PO_SJF: return "sjf";
+	default: return "-";
+	}
+}
 
 // Видове външни имена
 enum ExtKind {
@@ -95,7 +111,7 @@ bool MemAlloc(int32_t size, int32_t& base) {
 	base = -1;
 	int pick = -1;
 
-	// Търсене по стратегия First Fit
+	// Търсене по стратегия First-Fit
 	for (int i = 0; i < free_count; ++i) {
 		if (FreeB[i].size >= size) {
 			pick = i;
@@ -206,6 +222,7 @@ public:
 	static string line_buf;
 	static bool paused;
 	static int u_scroll; // Отместване при превъртане (0 = най-долу)
+	static int ov_scroll; // Отместване при превъртане в Overlay изглед
 
 	// Инициализация и проверка какво поддържа средата
 	static void Init() {
@@ -398,25 +415,29 @@ public:
 				WORD vk = ir.Event.KeyEvent.wVirtualKeyCode;
 				char ch = ir.Event.KeyEvent.uChar.AsciiChar;
 
-				// Прехващане на клавишите за скролване
-				if (vk == VK_PRIOR) { // Page Up
-					u_scroll += user_bottom - 1;
-					RepaintUser();
+				// Прехващане на клавишите за скролване в ПОТРЕБИТЕЛСКАТА конзола
+				if (overlay_buf.empty()) {
+					if (vk == VK_PRIOR) { u_scroll += user_bottom - 1; RepaintUser(); continue; }
+					if (vk == VK_NEXT) { u_scroll -= user_bottom - 1; RepaintUser(); continue; }
+					if (vk == VK_UP) { u_scroll += 1; RepaintUser(); continue; }
+					if (vk == VK_DOWN) { u_scroll -= 1; RepaintUser(); continue; }
 				}
-				else if (vk == VK_NEXT) { // Page Down
-					u_scroll -= user_bottom - 1;
-					RepaintUser();
+				else {
+					// Ако СМЕ в Overlay режим, променяме ov_scroll и подаваме сигнал за преначертаване
+					bool scrolled = false;
+					if (vk == VK_PRIOR) { ov_scroll -= scr_h - 1; scrolled = true; }
+					else if (vk == VK_NEXT) { ov_scroll += scr_h - 1; scrolled = true; }
+					else if (vk == VK_UP) { ov_scroll -= 1; scrolled = true; }
+					else if (vk == VK_DOWN) { ov_scroll += 1; scrolled = true; }
+
+					if (scrolled) {
+						c = 1; // Задаваме фиктивен символ, за да събудим OvShow()
+						return true; // Връщаме true, за да се преначертае екранът
+					}
 				}
-				else if (vk == VK_UP) { // Arrow Up
-					u_scroll += 1;
-					RepaintUser();
-				}
-				else if (vk == VK_DOWN) { // Arrow Down
-					u_scroll -= 1;
-					RepaintUser();
-				}
-				// Нормален символ
-				else if (ch != 0) {
+
+				// Връщаме нормален символ
+				if (ch != 0) {
 					c = ch;
 					return true;
 				}
@@ -479,22 +500,50 @@ public:
 			return;
 		}
 
-		ScrClearAll();
-		for (size_t i = 0; i < overlay_buf.size(); ++i) {
-			if (i < scr_h - 1) { // Оставяме последния ред за подканата
-				ScrPut(0, i, overlay_buf[i]);
+		ov_scroll = 0; // Нулираме скрола при всяко ново отваряне
+		bool in_overlay = true;
+
+		while (in_overlay) {
+			ScrClearAll();
+
+			// Изчисляваме максималното възможно скролване
+			int total_lines = overlay_buf.size();
+			int max_scroll = total_lines - (scr_h - 1);
+			if (max_scroll < 0) max_scroll = 0;
+
+			if (ov_scroll > max_scroll) ov_scroll = max_scroll;
+			if (ov_scroll < 0) ov_scroll = 0;
+
+			// Изчертаваме видимите редове
+			for (int i = 0; i < scr_h - 1; ++i) {
+				int buf_idx = i + ov_scroll;
+				if (buf_idx < total_lines) {
+					ScrPut(0, i, overlay_buf[buf_idx]);
+				}
+			}
+
+			// Индикатор и подкана най-долу
+			string prompt = "-- Натиснете Enter или Esc за изход";
+			if (max_scroll > 0) {
+				prompt += " | Скрол: " + to_string(ov_scroll) + "/" + to_string(max_scroll) + " (Стрелки / PgUp / PgDn)";
+			}
+			prompt += " --";
+			ScrPut(0, scr_h - 1, prompt);
+
+			// Изчакваме клавиш
+			char c;
+			while (!ReadCharNB(c)) {
+				Sleep(20);
+			}
+
+			// Обработка на клавиши
+			if (c == 27 || c == '\r' || c == '\n') { // Esc или Enter
+				in_overlay = false;
 			}
 		}
 
-		ScrPut(0, scr_h - 1, "-- Натиснете произволен клавиш --");
-
-		// Изчакваме натискане на клавиш
-		char c;
-		while (!ReadCharNB(c)) {
-			Sleep(20);
-		}
-
 		// Възстановяваме стандартния изглед на двете конзоли
+		OvClear();
 		ScrClearAll();
 		RepaintUser();
 		DrawSeparator();
@@ -520,6 +569,7 @@ string Console::line_buf = "";
 bool Console::paused = false;
 vector<string> Console::overlay_buf;
 int Console::u_scroll = 0;
+int Console::ov_scroll = 0;
 
 // ==========================================
 // Loader и зареждане в паметта
@@ -639,7 +689,7 @@ public:
 		pcb.state = PS_READY;
 
 		Console::SysMsg("[" + to_string(pcb.pid) + "] " + pcb.module_name + " стартиран, " +
-			to_string(pcb.image_size) + " думи, база " + to_string(pcb.base));
+			to_string(pcb.image_size) + " думи");
 
 		// Освобождаване на временния буфер
 		pcb.image.clear();
@@ -946,12 +996,25 @@ public:
 		return true;
 	}
 
-	// Помощна функция: намира първия готов процес
+	// Помощна функция: намира следващия готов процес според стратегията
 	static int PickNext() {
+		int best = 0;
 		for (int i = 1; i <= MAX_PROCS; ++i) {
-			if (Procs[i].used && Procs[i].state == PS_READY) return i;
+			if (Procs[i].used && Procs[i].state == PS_READY) {
+				if (best == 0) {
+					best = i;
+				}
+				else {
+					if (current_policy == PO_FIFO) {
+						if (Procs[i].pid < Procs[best].pid) best = i;
+					}
+					else if (current_policy == PO_SJF) {
+						if (Procs[i].est_time < Procs[best].est_time) best = i;
+					}
+				}
+			}
 		}
-		return 0;
+		return best;
 	}
 
 	// Изпълнява порция инструкции и връща управлението
@@ -1001,13 +1064,31 @@ void ProcessCommand(const string& line) {
 		is_running = false; // Спираме главния цикъл
 		return;
 	}
+
 	else if (cmd == "run") {
 		string filename;
-		iss >> filename;
-
-		if (filename.empty()) {
-			Console::SysMsg("Употреба: run <module.vmx>");
+		if (!(iss >> filename)) {
+			Console::SysMsg("Употреба: run <module.vmx> [prio=N] [time=N]");
 			return;
+		}
+
+		// Четене на допълнителните параметри за време и приоритет
+		int prio = 1;
+		int time = 1000000;
+		string token;
+		while (iss >> token) {
+			string lower_tok = token;
+			for (char& c : lower_tok) c = tolower(c);
+
+			if (lower_tok.find("prio=") == 0) {
+				try { prio = stoi(lower_tok.substr(5)); }
+				catch (...) {}
+				if (prio < 1) prio = 1;
+			}
+			else if (lower_tok.find("time=") == 0) {
+				try { time = stoi(lower_tok.substr(5)); }
+				catch (...) {}
+			}
 		}
 
 		// Проверка за разширение
@@ -1022,18 +1103,41 @@ void ProcessCommand(const string& line) {
 		// Инициализация на новия PCB
 		Procs[slot] = PCB();
 		Procs[slot].used = true;
-		Procs[slot].pid = next_pid++;
+		Procs[slot].pid = next_pid;
 		Procs[slot].module_name = filename;
 		Procs[slot].state = PS_NEW;
+		Procs[slot].priority = prio;
+		Procs[slot].est_time = time;
 
+		// Опит за зареждане
 		if (Loader::LoadModule(filename, Procs[slot])) {
+			next_pid++; // Увеличаваме PID само при успешно зареждане на модула
 			// Сменя състоянието на PS_READY
-			(Loader::AllocateAndStart(Procs[slot]));
+			Loader::AllocateAndStart(Procs[slot]);
 		}
 		else {
 			Procs[slot].used = false; // Освобождаваме слота при грешка
 		}
 	}
+
+	else if (cmd == "policy") {
+		string arg;
+		iss >> arg;
+		for (char& c : arg) c = tolower(c);
+
+		if (arg == "fifo") current_policy = PO_FIFO;
+		else if (arg == "sjf") current_policy = PO_SJF;
+		else {
+			Console::SysMsg("Употреба: policy fifo|sjf");
+			return;
+		}
+
+		// При смяна на стратегията освобождаваме процесора веднага, 
+		// за да може диспечерът да преподреди готовите процеси
+		cur_slot = 0;
+		Console::SysMsg("Стратегия за диспечиране: " + arg);
+	}
+
 	else if (cmd == "kill") {
 		int32_t pid;
 		if (!(iss >> pid)) {
@@ -1056,42 +1160,90 @@ void ProcessCommand(const string& line) {
 		Console::SysMsg("Процес [" + to_string(pid) + "] беше принудително прекратен.");
 		RetryWaiting();
 	}
+
 	else if (cmd == "proc" || cmd == "ps") {
 		// Показва всички процеси на цял екран
 		Console::OvClear();
 		Console::OvAdd("Таблица на процесите");
 		Console::OvAdd("");
-		Console::OvAdd(" PID  Модул            Състояние");
-		Console::OvAdd(" ---------------------------------------------------");
+		Console::OvAdd(" PID  Модул                  Състояние             Време  Приоритет");
+		Console::OvAdd(" --------------------------------------------------------------------");
 
 		for (int i = 1; i <= MAX_PROCS; ++i) {
 			if (Procs[i].used) {
 				stringstream ss;
 				ss << right << setw(4) << Procs[i].pid << "  "
-					<< left << setw(16) << Procs[i].module_name
-					<< " " << StateStr(Procs[i].state);
+					<< left << setw(24) << Procs[i].module_name
+					<< left << setw(20) << StateStr(Procs[i].state)
+					<< right << setw(7) << Procs[i].est_time << "  "
+					<< right << setw(9) << Procs[i].priority;
 				Console::OvAdd(ss.str());
 			}
 		}
+		Console::OvAdd("");
+		Console::OvAdd(" Стратегия: " + PolicyStr());
 		Console::OvShow();
 	}
+
 	else if (cmd == "ready") {
-		// Показва само готовите за изпълнение
 		Console::OvClear();
-		Console::OvAdd("Опашка на готовите процеси");
+		Console::OvAdd("Опашка на готовите процеси (подредена спрямо стратегията)");
 		Console::OvAdd("");
 
-		bool found = false;
+		if (cur_slot != 0 && Procs[cur_slot].used && (Procs[cur_slot].state == PS_READY || Procs[cur_slot].state == PS_RUNNING)) {
+			Console::OvAdd(" Държи процесора: [" + to_string(Procs[cur_slot].pid) + "] " + Procs[cur_slot].module_name);
+		}
+		else {
+			Console::OvAdd(" Държи процесора: никой");
+		}
+		Console::OvAdd("");
+
+		vector<int> q;
 		for (int i = 1; i <= MAX_PROCS; ++i) {
-			if (Procs[i].used && Procs[i].state == PS_READY) {
-				Console::OvAdd(" [" + to_string(Procs[i].pid) + "] " + Procs[i].module_name);
-				found = true;
+			if (Procs[i].used && i != cur_slot && (Procs[i].state == PS_READY || Procs[i].state == PS_RUNNING)) {
+				q.push_back(i);
 			}
 		}
-		if (!found) Console::OvAdd(" Опашката е празна.");
 
+		// Сортиране на опашката точно както я вижда диспечерът
+		for (size_t i = 0; i < q.size(); ++i) {
+			for (size_t j = i + 1; j < q.size(); ++j) {
+				bool swap = false;
+				if (current_policy == PO_FIFO) {
+					if (Procs[q[j]].pid < Procs[q[i]].pid) swap = true;
+				}
+				else if (current_policy == PO_SJF) {
+					if (Procs[q[j]].est_time < Procs[q[i]].est_time) swap = true;
+				}
+				if (swap) {
+					int tmp = q[i]; q[i] = q[j]; q[j] = tmp;
+				}
+			}
+		}
+
+		if (q.empty()) {
+			Console::OvAdd(" Опашката е празна.");
+		}
+		else {
+			Console::OvAdd(" #   PID  Модул             Приоритет  Очаквано време");
+			Console::OvAdd(" ----------------------------------------------------");
+			for (size_t i = 0; i < q.size(); ++i) {
+				int p = q[i];
+				stringstream ss;
+				ss << right << setw(2) << (i + 1) << "  "
+					<< right << setw(3) << Procs[p].pid << "  "
+					<< left << setw(16) << Procs[p].module_name << "  "
+					<< right << setw(7) << Procs[p].priority << "  "
+					<< right << setw(13) << Procs[p].est_time;
+				Console::OvAdd(ss.str());
+			}
+		}
+
+		Console::OvAdd("");
+		Console::OvAdd(" Стратегия: " + PolicyStr());
 		Console::OvShow();
 	}
+
 	else if (cmd == "trace") {
 		string arg;
 		iss >> arg;
@@ -1120,7 +1272,7 @@ void ProcessCommand(const string& line) {
 		}
 	}
 	else {
-		Console::SysMsg("Непозната команда: " + cmd + " (достъпни: run, kill, trace, proc, ready, quit)");
+		Console::SysMsg("Непозната команда: " + cmd + " (достъпни: run, policy, kill, trace, proc, ready, quit)");
 	}
 }
 
