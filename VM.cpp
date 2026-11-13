@@ -1271,8 +1271,56 @@ void ProcessCommand(const string& line) {
 			Console::SysMsg("Употреба: trace on|off|<pid>");
 		}
 	}
+
+	else if (cmd == "pause") {
+		Console::paused = true;
+
+		// Ако има процес, който държи процесора в момента, го връщаме в опашката на готовите
+		if (cur_slot != 0) {
+			if (Procs[cur_slot].state == PS_RUNNING) {
+				Procs[cur_slot].state = PS_READY;
+			}
+			cur_slot = 0; // Освобождаваме процесора
+		}
+
+		Console::DrawSeparator(); // Преначертава разделителната линия, за да покаже --[ ПАУЗА ]--
+		Console::SysMsg("Системата е на пауза.");
+		}
+
+	else if (cmd == "resume") {
+			Console::paused = false;
+			Console::DrawSeparator(); // Възстановява стандартната разделителна линия
+			Console::SysMsg("Изпълнението е възобновено.");
+			}
+
+	else if (cmd == "help") {
+		Console::OvClear();
+		Console::OvAdd("Системни команди на конзолата");
+		Console::OvAdd("");
+
+		// Помощна ламбда функция за подравняване на командите и описанията
+		auto addHelp = [](const string& command, const string& desc) {
+			stringstream ss;
+			ss << left << setw(35) << command << desc;
+			Console::OvAdd(ss.str());
+			};
+
+		addHelp("run <module> [prio=n] [time=n]", "стартиране на нов процес");
+		addHelp("kill <pid>", "прекратяване на процес");
+		addHelp("proc", "таблица на всички процеси (PCB)");
+		addHelp("ready", "таблица на готовите процеси");
+		addHelp("policy fifo|sjf|rr", "стратегия за диспечиране");
+		addHelp("pause", "замразяване на всички процеси");
+		addHelp("resume", "възобновяване на изпълнението");
+		addHelp("trace on|off|<pid>", "трасиране на инструкциите");
+		addHelp("help", "този списък");
+		addHelp("quit", "изход");
+
+		Console::OvShow();
+	}
 	else {
-		Console::SysMsg("Непозната команда: " + cmd + " (достъпни: run, policy, kill, trace, proc, ready, quit)");
+		// При въвеждане на грешна команда, насочваме потребителя към help
+		Console::SysMsg("Непозната команда. Въведете help за списък с команди.");
 	}
 }
 
@@ -1295,10 +1343,12 @@ int main(int argc, char* argv[]) {
 
 	// Основен цикъл на ОС
 	while (is_running) {
-		// 1. Споделяне на времето с процесора (изпълнява се част от програмата)
-		CPU::RunSlice();
+		// 1. Споделяне на времето с процесора (само ако системата не е на пауза)
+		if (!Console::paused) {
+			CPU::RunSlice();
+		}
 
-		// 2. Неблокиращо четене от клавиатурата за системната конзола
+		// 2. Неблокирано четене от клавиатурата за системната конзола
 		char c;
 		while (Console::ReadCharNB(c)) {
 			if (c == '\r' || c == '\n') {
@@ -1323,7 +1373,7 @@ int main(int argc, char* argv[]) {
 			}
 		}
 
-		// 3. Ако системата бездейства (няма готови процеси), приспиваме леко за пестене на CPU ресурс
+		// 3. Ако системата бездейства (няма готови процеси), я приспиваме за пестене на CPU ресурс
 		if (cur_slot == 0 && CPU::PickNext() == 0) {
 			Sleep(5);
 		}
