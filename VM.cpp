@@ -35,15 +35,19 @@ enum ProcessState {
 // Стратегии за диспечиране
 enum PolicyType {
 	PO_FIFO,
-	PO_SJF
+	PO_SJF,
+	PO_RR
 };
 
 PolicyType current_policy = PO_FIFO;
+int32_t current_quantum = 100; // Квант време по подразбиране (в брой инструкции)
+int32_t last_rr_slot = 0;      // Показалец за кръговото обслужване (последно изпълняван слот)
 
 string PolicyStr() {
 	switch (current_policy) {
 	case PO_FIFO: return "fifo";
 	case PO_SJF: return "sjf";
+	case PO_RR: return "rr";
 	default: return "-";
 	}
 }
@@ -998,6 +1002,21 @@ public:
 
 	// Помощна функция: намира следващия готов процес според стратегията
 	static int PickNext() {
+		// За RR: кръгово сканиране след последния изпълняван слот
+		if (current_policy == PO_RR) {
+			for (int i = 1; i <= MAX_PROCS; ++i) {
+				int idx = (last_rr_slot + i) % MAX_PROCS;
+				if (idx == 0) idx = MAX_PROCS; // Поддържаме индекси от 1 до 32
+
+				if (Procs[idx].used && Procs[idx].state == PS_READY) {
+					last_rr_slot = idx; // Запомняме кой процес заема процесора
+					return idx;
+				}
+			}
+			return 0;
+		}
+
+		// За FIFO и SJF: търсене на екстремум
 		int best = 0;
 		for (int i = 1; i <= MAX_PROCS; ++i) {
 			if (Procs[i].used && Procs[i].state == PS_READY) {
@@ -1017,7 +1036,7 @@ public:
 		return best;
 	}
 
-	// Изпълнява порция инструкции и връща управлението
+	// Изпълнява порция инструкции и управлява контекста
 	static void RunSlice() {
 		if (cur_slot == 0) {
 			cur_slot = PickNext();
@@ -1032,21 +1051,35 @@ public:
 
 		Procs[cur_slot].state = PS_RUNNING;
 		int n = 0;
-		const int CONSOLE_SLICE = 300; // Брой инструкции, преди да проверим конзолата
 
-		while (n < CONSOLE_SLICE && Procs[cur_slot].used && Procs[cur_slot].state == PS_RUNNING) {
+		// Определяне на лимита на порцията:
+		// Ако е RR, използваме зададения квант. Иначе ползваме 300, за да не блокираме конзолата.
+		int slice_limit = (current_policy == PO_RR) ? current_quantum : 300;
+
+		while (n < slice_limit && Procs[cur_slot].used && Procs[cur_slot].state == PS_RUNNING) {
 			if (!ExecOne(Procs[cur_slot])) {
 				break; // Процесът приключи, блокира или даде грешка
 			}
 			n++;
 		}
 
-		// Ако процесът все още работи, го връщаме в PS_READY, за да може главният цикъл
-		// да обработи конзолата, след което PickNext отново ще го избере.
+		// Управление на превключването на контекста след края на цикъла
 		if (Procs[cur_slot].used && Procs[cur_slot].state == PS_RUNNING) {
-			Procs[cur_slot].state = PS_READY;
+			if (current_policy == PO_RR) {
+				// ПРЕВКЛЮЧВАНЕ НА КОНТЕКСТА (Preemptive):
+				// Квантът е изтекъл. Процесът се връща в PS_READY и освобождава процесора.
+				Procs[cur_slot].state = PS_READY;
+				cur_slot = 0;
+			}
+			else {
+				// БЕЗ ПРЕВКЛЮЧВАНЕ НА КОНТЕКСТА (Non-preemptive за FIFO и SJF):
+				// Процесът запазва процесора (cur_slot НЕ се нулира), 
+				// но отстъпва временно контрола към главния цикъл на ОС.
+				Procs[cur_slot].state = PS_READY;
+			}
 		}
 		else {
+			// Процесът е блокирал, завършил или дал грешка
 			cur_slot = 0;
 		}
 	}
@@ -1127,15 +1160,27 @@ void ProcessCommand(const string& line) {
 
 		if (arg == "fifo") current_policy = PO_FIFO;
 		else if (arg == "sjf") current_policy = PO_SJF;
+		else if (arg == "rr") current_policy = PO_RR;
 		else {
-			Console::SysMsg("Употреба: policy fifo|sjf");
+			Console::SysMsg("Употреба: policy fifo|sjf|rr");
 			return;
 		}
 
-		// При смяна на стратегията освобождаваме процесора веднага, 
-		// за да може диспечерът да преподреди готовите процеси
+		// При смяна на стратегията освобождаваме процесора веднага
 		cur_slot = 0;
+		last_rr_slot = 0; // Нулираме кръговия показалец
 		Console::SysMsg("Стратегия за диспечиране: " + arg);
+	}
+
+	else if (cmd == "quantum") {
+		int32_t q;
+		if (iss >> q && q > 0) {
+			current_quantum = q;
+			Console::SysMsg("Квантът е зададен на: " + to_string(current_quantum) + " инструкции.");
+		}
+		else {
+			Console::SysMsg("Употреба: quantum <n> (където n > 0)");
+		}
 	}
 
 	else if (cmd == "kill") {
@@ -1215,6 +1260,14 @@ void ProcessCommand(const string& line) {
 				else if (current_policy == PO_SJF) {
 					if (Procs[q[j]].est_time < Procs[q[i]].est_time) swap = true;
 				}
+				else if (current_policy == PO_RR) {
+					// Подредба спрямо кръговия показалец last_rr_slot
+					int dist_i = (q[i] - last_rr_slot + MAX_PROCS) % MAX_PROCS;
+					if (dist_i == 0) dist_i = MAX_PROCS;
+					int dist_j = (q[j] - last_rr_slot + MAX_PROCS) % MAX_PROCS;
+					if (dist_j == 0) dist_j = MAX_PROCS;
+					if (dist_j < dist_i) swap = true;
+				}
 				if (swap) {
 					int tmp = q[i]; q[i] = q[j]; q[j] = tmp;
 				}
@@ -1285,13 +1338,13 @@ void ProcessCommand(const string& line) {
 
 		Console::DrawSeparator(); // Преначертава разделителната линия, за да покаже --[ ПАУЗА ]--
 		Console::SysMsg("Системата е на пауза.");
-		}
+	}
 
 	else if (cmd == "resume") {
-			Console::paused = false;
-			Console::DrawSeparator(); // Възстановява стандартната разделителна линия
-			Console::SysMsg("Изпълнението е възобновено.");
-			}
+		Console::paused = false;
+		Console::DrawSeparator(); // Възстановява стандартната разделителна линия
+		Console::SysMsg("Изпълнението е възобновено.");
+	}
 
 	else if (cmd == "help") {
 		Console::OvClear();
@@ -1303,13 +1356,14 @@ void ProcessCommand(const string& line) {
 			stringstream ss;
 			ss << left << setw(35) << command << desc;
 			Console::OvAdd(ss.str());
-			};
+		};
 
 		addHelp("run <module> [prio=n] [time=n]", "стартиране на нов процес");
 		addHelp("kill <pid>", "прекратяване на процес");
 		addHelp("proc", "таблица на всички процеси (PCB)");
 		addHelp("ready", "таблица на готовите процеси");
 		addHelp("policy fifo|sjf|rr", "стратегия за диспечиране");
+		addHelp("quantum <n>", "квант време в брой инструкции (за rr)");
 		addHelp("pause", "замразяване на всички процеси");
 		addHelp("resume", "възобновяване на изпълнението");
 		addHelp("trace on|off|<pid>", "трасиране на инструкциите");
@@ -1318,6 +1372,7 @@ void ProcessCommand(const string& line) {
 
 		Console::OvShow();
 	}
+
 	else {
 		// При въвеждане на грешна команда, насочваме потребителя към help
 		Console::SysMsg("Непозната команда. Въведете help за списък с команди.");
