@@ -98,6 +98,24 @@ struct FreeBlk {
 	int32_t size;
 };
 
+// Стратегии за разпределяне на паметта
+enum MemFitType {
+	MF_FIRST,
+	MF_BEST,
+	MF_WORST
+};
+
+MemFitType current_memfit = MF_FIRST;
+
+string MemFitStr() {
+	switch (current_memfit) {
+	case MF_FIRST: return "first";
+	case MF_BEST:  return "best";
+	case MF_WORST: return "worst";
+	default:       return "-";
+	}
+}
+
 const int32_t MAX_FREE = 64;
 vector<FreeBlk> FreeB(MAX_FREE);
 int32_t free_count = 0;
@@ -110,20 +128,34 @@ void MemInit() {
 	fill(Memory.begin(), Memory.end(), 0);
 }
 
+// Разпределяне на паметта (first-fit, best-fit, worst-fit)
 bool MemAlloc(int32_t size, int32_t& base) {
 	if (size <= 0) return false;
 	base = -1;
 	int pick = -1;
 
-	// Търсене по стратегия First-Fit
 	for (int i = 0; i < free_count; ++i) {
-		if (FreeB[i].size >= size) {
+		if (FreeB[i].size < size) continue;
+
+		if (current_memfit == MF_FIRST) {
 			pick = i;
-			break;
+			break; // Първият достатъчно голям блок
+		}
+		else if (current_memfit == MF_BEST) {
+			// Най-малкият достатъчно голям блок (минимален остатък)
+			if (pick < 0 || FreeB[i].size < FreeB[pick].size) {
+				pick = i;
+			}
+		}
+		else if (current_memfit == MF_WORST) {
+			// Най-големият свободен блок (максимален остатък)
+			if (pick < 0 || FreeB[i].size > FreeB[pick].size) {
+				pick = i;
+			}
 		}
 	}
 
-	if (pick < 0) return false; // Няма достатъчно памет
+	if (pick < 0) return false; // Няма достатъчно голям свободен блок
 
 	base = FreeB[pick].base;
 
@@ -134,7 +166,7 @@ bool MemAlloc(int32_t size, int32_t& base) {
 		}
 		free_count--;
 	}
-	// Иначе просто намаляваме размера му и местим базата напред
+	// Иначе намаляваме размера му и преместваме началото му напред
 	else {
 		FreeB[pick].base += size;
 		FreeB[pick].size -= size;
@@ -143,11 +175,11 @@ bool MemAlloc(int32_t size, int32_t& base) {
 	return true;
 }
 
-// Освобождаване на паметта
+// Освобождаване на паметта със сливане на съседните свободни блокове
 void MemFree(int32_t base, int32_t size) {
 	if (size <= 0 || free_count >= MAX_FREE) return;
 
-	// Намираме правилната позиция за вмъкване, за да държим списъка сортиран по адрес
+	// 1. Намираме позицията за сортирано вмъкване по адрес
 	int pos = free_count;
 	for (int i = 0; i < free_count; ++i) {
 		if (FreeB[i].base > base) {
@@ -156,15 +188,31 @@ void MemFree(int32_t base, int32_t size) {
 		}
 	}
 
-	// Отместваме останалите блокове
+	// Отместваме елементите надясно и вмъкваме новия блок
 	for (int i = free_count; i > pos; --i) {
 		FreeB[i] = FreeB[i - 1];
 	}
-
-	// Вмъкваме новия свободен блок
 	FreeB[pos].base = base;
 	FreeB[pos].size = size;
 	free_count++;
+
+	// 2. Сливане с десния съсед (ако краят на pos съвпада с началото на pos + 1)
+	if (pos + 1 < free_count && FreeB[pos].base + FreeB[pos].size == FreeB[pos + 1].base) {
+		FreeB[pos].size += FreeB[pos + 1].size;
+		for (int i = pos + 1; i < free_count - 1; ++i) {
+			FreeB[i] = FreeB[i + 1];
+		}
+		free_count--;
+	}
+
+	// 3. Сливане с левия съсед (ако краят на pos - 1 съвпада с началото на pos)
+	if (pos > 0 && FreeB[pos - 1].base + FreeB[pos - 1].size == FreeB[pos].base) {
+		FreeB[pos - 1].size += FreeB[pos].size;
+		for (int i = pos; i < free_count - 1; ++i) {
+			FreeB[i] = FreeB[i + 1];
+		}
+		free_count--;
+	}
 }
 
 // Глобална таблица на процесите
@@ -1194,7 +1242,7 @@ void ProcessCommand(const string& line) {
 			Console::SysMsg("Не е намерен процес с PID " + to_string(pid));
 			return;
 		}
-		if (Procs[slot].state != PS_WAIT_MEM) {
+		if (Procs[slot].state != PS_WAIT_MEM && Procs[slot].state != PS_DONE && Procs[slot].state != PS_NEW) {
 			MemFree(Procs[slot].base, Procs[slot].image_size);
 		}
 
@@ -1346,6 +1394,122 @@ void ProcessCommand(const string& line) {
 		Console::SysMsg("Изпълнението е възобновено.");
 	}
 
+	else if (cmd == "memfit") {
+		string arg;
+		iss >> arg;
+		for (char& c : arg) c = tolower(c);
+
+		if (arg == "first") current_memfit = MF_FIRST;
+		else if (arg == "best") current_memfit = MF_BEST;
+		else if (arg == "worst") current_memfit = MF_WORST;
+		else {
+			Console::SysMsg("Употреба: memfit first|best|worst");
+			return;
+		}
+		Console::SysMsg("Стратегия за разпределяне на паметта: " + arg);
+	}
+
+	else if (cmd == "mem") {
+		struct MemSeg {
+			int32_t base;
+			int32_t size;
+			bool is_free;
+			int32_t pid;
+			string name;
+		};
+
+		vector<MemSeg> segs;
+		int32_t used_mem = 0;
+
+		// 1. Събираме всички заети блокове на активни процеси
+		for (int i = 1; i <= MAX_PROCS; ++i) {
+			if (Procs[i].used &&
+				Procs[i].state != PS_NEW &&
+				Procs[i].state != PS_WAIT_MEM &&
+				Procs[i].state != PS_DONE) {
+				segs.push_back({ Procs[i].base, Procs[i].image_size, false, Procs[i].pid, Procs[i].module_name });
+				used_mem += Procs[i].image_size;
+			}
+		}
+
+		// 2. Събираме всички свободни блокове и изчисляваме метриките
+		int32_t total_free = 0;
+		int32_t max_free_blk = 0;
+		for (int i = 0; i < free_count; ++i) {
+			segs.push_back({ FreeB[i].base, FreeB[i].size, true, 0, "" });
+			total_free += FreeB[i].size;
+			if (FreeB[i].size > max_free_blk) {
+				max_free_blk = FreeB[i].size;
+			}
+		}
+
+		// 3. Сортираме сегментите по начален адрес
+		for (size_t i = 0; i < segs.size(); ++i) {
+			for (size_t j = i + 1; j < segs.size(); ++j) {
+				if (segs[j].base < segs[i].base) {
+					MemSeg tmp = segs[i];
+					segs[i] = segs[j];
+					segs[j] = tmp;
+				}
+			}
+		}
+
+		// 4. Изчисляване на външната фрагментация
+		// Дял от свободната памет, който остава извън най-големия непрекъснат блок
+		int32_t frag_words = (total_free > 0) ? (total_free - max_free_blk) : 0;
+		double frag_pct = (total_free > 0) ? (100.0 * frag_words / total_free) : 0.0;
+
+		Console::OvClear();
+		Console::OvAdd("Карта на потребителската памет (MEM_SIZE = " + to_string(MEM_SIZE) + " думи)");
+		Console::OvAdd("Стратегия за памет: " + MemFitStr());
+		Console::OvAdd("");
+		Console::OvAdd(" Адресна област      Размер  Състояние");
+		Console::OvAdd(" ------------------------------------------------------------");
+
+		for (const auto& s : segs) {
+			stringstream ss;
+			ss << " [" << right << setw(4) << s.base << " .. " << setw(4) << (s.base + s.size - 1) << "]  "
+				<< right << setw(6) << s.size << "  ";
+			if (s.is_free) {
+				ss << "СВОБОДЕН";
+			}
+			else {
+				ss << "Зает: [" << s.pid << "] " << s.name;
+			}
+			Console::OvAdd(ss.str());
+		}
+
+		Console::OvAdd("");
+		Console::OvAdd(" Статистика:");
+		Console::OvAdd("   Заета памет:           " + to_string(used_mem) + " думи");
+		Console::OvAdd("   Свободна памет:        " + to_string(total_free) + " думи (в " + to_string(free_count) + " блока)");
+		Console::OvAdd("   Най-голям свободен:    " + to_string(max_free_blk) + " думи");
+
+		stringstream fss;
+		fss << "   Външна фрагментация:   " << frag_words << " думи ("
+			<< fixed << setprecision(1) << frag_pct << "%)";
+		Console::OvAdd(fss.str());
+
+		// Показване на чакащите за памет процеси (пряко доказателство за външна фрагментация)
+		bool any_wait = false;
+		for (int i = 1; i <= MAX_PROCS; ++i) {
+			if (Procs[i].used && Procs[i].state == PS_WAIT_MEM) {
+				if (!any_wait) {
+					Console::OvAdd("");
+					Console::OvAdd(" Чакащи памет процеси:");
+					any_wait = true;
+				}
+				string note = (Procs[i].image_size <= total_free)
+					? "  <-- ВЪНШНА ФРАГМЕНТАЦИЯ (общата свободна памет стига, но е накъсана)"
+					: "  (недостатъчна обща свободна памет)";
+				Console::OvAdd("   [" + to_string(Procs[i].pid) + "] " + Procs[i].module_name +
+					" (иска " + to_string(Procs[i].image_size) + " думи)" + note);
+			}
+		}
+
+		Console::OvShow();
+	}
+
 	else if (cmd == "help") {
 		Console::OvClear();
 		Console::OvAdd("Системни команди на конзолата");
@@ -1356,7 +1520,7 @@ void ProcessCommand(const string& line) {
 			stringstream ss;
 			ss << left << setw(35) << command << desc;
 			Console::OvAdd(ss.str());
-		};
+			};
 
 		addHelp("run <module> [prio=n] [time=n]", "стартиране на нов процес");
 		addHelp("kill <pid>", "прекратяване на процес");
@@ -1366,6 +1530,8 @@ void ProcessCommand(const string& line) {
 		addHelp("quantum <n>", "квант време в брой инструкции (за rr)");
 		addHelp("pause", "замразяване на всички процеси");
 		addHelp("resume", "възобновяване на изпълнението");
+		addHelp("mem", "карта на потребителската памет и фрагментация");
+		addHelp("memfit first|best|worst", "стратегия за разпределяне на паметта");
 		addHelp("trace on|off|<pid>", "трасиране на инструкциите");
 		addHelp("help", "този списък");
 		addHelp("quit", "изход");
